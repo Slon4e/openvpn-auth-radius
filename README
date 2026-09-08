@@ -1,3 +1,208 @@
+# Slon4e fork — improved Framed-Route handling for OpenVPN remote-access clients
+
+This fork contains an improvement to the handling of the RADIUS `Framed-Route` attribute in `openvpn-auth-radius`, primarily intended for OpenVPN remote-access deployments using daloRADIUS as the frontend for FreeRADIUS.
+
+The tested configuration flow is:
+
+daloRADIUS → FreeRADIUS → `Framed-Route` → `openvpn-auth-radius` → OpenVPN CCD → `push "route ..."`
+
+The original `openvpn-auth-radius` implementation writes RADIUS `Framed-Route` attributes to the OpenVPN client configuration directory as `iroute` directives.
+
+For example:
+
+```text
+Framed-Route = 10.10.0.0/16
+```
+
+was written as:
+
+```text
+iroute 10.10.0.0 255.255.0.0
+```
+
+`iroute` is appropriate when the specified network is located behind an OpenVPN client.
+
+For standard remote-access VPN users, however, the desired behavior is often to push the route to the connecting client.
+
+This fork therefore changes the generated CCD directive to:
+
+```text
+push "route 10.10.0.0 255.255.0.0"
+```
+
+instead of:
+
+```text
+iroute 10.10.0.0 255.255.0.0
+```
+
+The `Framed-Route` parser has also been simplified.
+
+The original implementation expects the traditional RADIUS route format:
+
+```text
+10.10.0.0/16 10.8.0.1/32 1
+```
+
+where the additional values represent the gateway and metric.
+
+For routes pushed to OpenVPN remote-access clients, these values are not required. The updated implementation therefore accepts a simple network/CIDR value:
+
+```text
+10.10.0.0/16
+```
+
+Gateway and metric fields are no longer required for this use case. If they are supplied, values following the `network/prefix` portion are ignored by the client-pushed-route implementation.
+
+This is particularly useful when different OpenVPN server instances use different tunnel networks.
+
+Example:
+
+```text
+TCP OpenVPN instance: 10.8.0.0/24
+UDP OpenVPN instance: 10.9.0.0/24
+```
+
+FreeRADIUS can return the same route attributes for users connecting through either instance:
+
+```text
+Framed-Route = 10.10.0.0/16
+Framed-Route = 10.30.30.0/24
+```
+
+There is no requirement to configure a TCP-specific gateway such as `10.8.0.1` or a UDP-specific gateway such as `10.9.0.1` in the `Framed-Route` value.
+
+When daloRADIUS is used as the frontend for FreeRADIUS, the routes can therefore be managed directly as per-user Reply Attributes:
+
+```text
+Framed-Route += 10.10.0.0/16
+Framed-Route += 10.30.30.0/24
+```
+
+FreeRADIUS returns these attributes in the Access-Accept response and `openvpn-auth-radius` generates the corresponding OpenVPN CCD configuration:
+
+```text
+push "route 10.10.0.0 255.255.0.0"
+push "route 10.30.30.0 255.255.255.0"
+```
+
+This removes the need to manually maintain per-user pushed routes in OpenVPN CCD files.
+
+## CIDR-to-netmask fix
+
+The original CIDR-to-netmask conversion code could generate malformed IPv4 netmasks for some prefixes.
+
+For example:
+
+```text
+/16 -> 255.255.0
+```
+
+instead of:
+
+```text
+/16 -> 255.255.0.0
+```
+
+This fork replaces the old conversion logic with direct 32-bit IPv4 netmask generation.
+
+Examples:
+
+```text
+/8  -> 255.0.0.0
+/16 -> 255.255.0.0
+/20 -> 255.255.240.0
+/24 -> 255.255.255.0
+/30 -> 255.255.255.252
+/32 -> 255.255.255.255
+```
+
+## Example with daloRADIUS / FreeRADIUS
+
+Configure the user's Reply Attributes in daloRADIUS as:
+
+```text
+Framed-Route += 10.10.0.0/16
+Framed-Route += 10.30.30.0/24
+```
+
+FreeRADIUS returns:
+
+```text
+Framed-Route = 10.10.0.0/16
+Framed-Route = 10.30.30.0/24
+```
+
+and the plugin writes:
+
+```text
+push "route 10.10.0.0 255.255.0.0"
+push "route 10.30.30.0 255.255.255.0"
+```
+
+## Tested environment
+
+The changes in this fork have been successfully tested with:
+
+```text
+Ubuntu Server 24.04 LTS
+OpenVPN 2.7.x
+FreeRADIUS 3.x
+daloRADIUS
+openvpn-auth-radius
+```
+
+The test environment used separate TCP and UDP OpenVPN server instances with different VPN subnets and per-user route definitions managed through daloRADIUS / FreeRADIUS.
+
+## Building this fork
+
+On Ubuntu Server 24.04 LTS:
+
+```bash
+apt update
+apt install -y git build-essential libgcrypt20-dev
+
+git clone https://github.com/Slon4e/openvpn-auth-radius.git
+cd openvpn-auth-radius
+
+make
+```
+
+The resulting plugin is:
+
+```text
+radiusplugin.so
+```
+
+It may be installed separately from the distribution-provided version:
+
+```bash
+mkdir -p /usr/local/lib/openvpn
+cp radiusplugin.so /usr/local/lib/openvpn/radiusplugin-custom.so
+chmod 755 /usr/local/lib/openvpn/radiusplugin-custom.so
+```
+
+Example OpenVPN configuration:
+
+```text
+plugin /usr/local/lib/openvpn/radiusplugin-custom.so /etc/openvpn/radiusplugin-tcp.cnf
+```
+
+or for a UDP OpenVPN instance:
+
+```text
+plugin /usr/local/lib/openvpn/radiusplugin-custom.so /etc/openvpn/radiusplugin-udp.cnf
+```
+
+## Compatibility note
+
+This change intentionally changes the interpretation of `Framed-Route` for this fork from an OpenVPN `iroute` to a client-pushed `route`.
+
+If your deployment uses `Framed-Route` to describe networks that are located behind an OpenVPN client, the original upstream `iroute` behavior may be more appropriate.
+
+---
+*****************************************************************************************************************************************************************
+The original upstream README follows below.
 /*
  *  radiusplugin -- An OpenVPN plugin for do radius authentication.
  * 
