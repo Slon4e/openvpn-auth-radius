@@ -1599,161 +1599,70 @@ int UserAuth::createCcdFile(PluginContext *context)
 				{
 					while (route!=NULL)
 					{
-						j=0;k=0;
-						//set everything back for the next route entry
-						memset(mask_part,0,6);
-						memset(framednetmask_cidr,0,3);
-						memset(framedip,0,16);
-						memset(framednetmask,0,16);
-						memset(framedgw,0,16);
-						memset(framedmetric,0,5);
-						
-						//add ip address to string
-						while(route[j]!='/' && j<len)
-							{
-								if (route[j]!=' ')
-								{
-									framedip[k]=route[j];
-									k++;
-								}
-								j++;
-							}
-							k=0;
-							j++;
-							//add netmask
-							while(route[j]!=' ' && j<=len)
-							{
-								framednetmask_cidr[k]=route[j];
-								k++;
-								j++;
-							}
-							k=0;
-							//jump spaces
-							while(route[j]==' ' && j<len)
-							{
-								j++;
-							}
-							//find gateway
-							while(route[j]!='/' && j<len)
-							{
-								if (route[j]!=' ')
-								{
-									framedgw[k]=route[j];
-									k++;
-								}
-								j++;
-							}
-							j++;
-							
-							//find gateway netmask (this isn't used
-							//at the command route under linux)
-							while(route[j]!=' ' && j<len)
-							{
-								j++;
-							}
-							//jump spaces
-							
-							while(route[j]==' ' && j<len )
-							{
-								j++;
-							}
-							k=0;
-							if (j<=len)
-							{
-							
-								k=0;
-								//find the metric
-								while(route[j]!=' ' && j<len)
-								{
-									framedmetric[k]=route[j];
-									k++;
-									j++;
-								}
-							}
-																								
-							//create string for client config file
-							//transform framednetmask_cidr
-							d2=7;
-							d1=0;
-							memset(framednetmask,0,16);
-							if (atoi(framednetmask_cidr)>32)
-							{
-								cerr << getTime() << "RADIUS-PLUGIN: Bad net CIDR netmask.\n";
-							}
-							else
-							{
-								for (k=1; k<=atoi(framednetmask_cidr); k++)
-								{
-									d1=d1+pow(2,d2);
-									d2--;
-									
-									if (k==8)
-									{
-										sprintf(mask_part,"%.0lf.", d1);
-										d1=0;
-										d2=7;
-										strncat(framednetmask, mask_part, 4);
-										memset(mask_part,0,6);
-									}
-									if(k==16)
-									{
-										sprintf(mask_part,"%.0lf.", d1);
-										d1=0;
-										d2=7;
-										strncat(framednetmask, mask_part, 4);
-										memset(mask_part,0,6);
-									}
-									if(k==24)
-									{
-										sprintf(mask_part,"%.0lf.", d1);
-										d1=0;
-										d2=7;
-										strncat(framednetmask, mask_part, 4);
-										memset(mask_part,0,6);
-									}
-								}
-								if (j<8)
-								{
-										sprintf(mask_part,"%.0lf.", d1);
-										d1=0;
-										strncat(framednetmask, mask_part, 4);
-										strncat(framednetmask, "0.0.0", 5);
-										memset(mask_part,0,6);
-								}
-								else if (j<16)
-								{
-										sprintf(mask_part,"%.0lf.", d1);
-										d1=0;
-										strncat(framednetmask, mask_part, 4);
-										strncat(framednetmask, "0.0", 3);
-										memset(mask_part,0,6);
-								}
-								else if (j<24)
-								{
-										sprintf(mask_part,"%.0lf.", d1);
-										d1=0;
-										strncat(framednetmask, mask_part, 4);
-										strncat(framednetmask, "0", 1);
-										memset(mask_part,0,6);
-								}
-								else if (j>24)
-								{
-										sprintf(mask_part,"%.0lf", d1);
-										d1=0;
-										strncat(framednetmask, mask_part, 4);
-										memset(mask_part,0,6);
-								}
-								
-								
-							}
-							
-							if (DEBUG (context->getVerbosity()))
-		    						cerr << getTime() << "RADIUS-PLUGIN: Write route string: iroute " << framedip << framednetmask << " to ccd-file.\n";
-			
-							//write iroute to client file
-							ccdfile << "iroute " << framedip << " "<< framednetmask << "\n";
-						
-							route=strtok(NULL,";");
+					        int cidr = -1;
+
+					        memset(framedip, 0, 16);
+					        memset(framednetmask, 0, 16);
+
+					        /*
+					         * Accept:
+					         *   10.10.0.0/16
+					         *
+					         * Also accepts the old RADIUS form:
+					         *   10.10.0.0/16 10.8.0.1/32 1
+					         *
+					         * Everything after network/prefix is ignored.
+					         */
+					        if (sscanf(route, " %15[^/]/%d", framedip, &cidr) != 2)
+					        {
+					                cerr << getTime()
+					                     << "RADIUS-PLUGIN: Invalid Framed-Route: "
+					                     << route << "\n";
+					        }
+					        else if (cidr < 0 || cidr > 32)
+					        {
+					                cerr << getTime()
+					                     << "RADIUS-PLUGIN: Invalid CIDR in Framed-Route: "
+					                     << route << "\n";
+					        }
+					        else
+					        {
+					                struct in_addr network_addr;
+					                struct in_addr mask_addr;
+
+					                if (inet_pton(AF_INET, framedip, &network_addr) != 1)
+					                {
+					                        cerr << getTime()
+					                             << "RADIUS-PLUGIN: Invalid IPv4 network in Framed-Route: "
+					                             << route << "\n";
+					                }
+					                else
+					                {
+					                        uint32_t mask =
+					                                (cidr == 0)
+					                                ? 0
+					                                : (0xFFFFFFFFU << (32 - cidr));
+
+					                        mask_addr.s_addr = htonl(mask);
+
+					                        strncpy(framednetmask, inet_ntoa(mask_addr), 15);
+					                        framednetmask[15] = '\0';
+
+					                        if (DEBUG (context->getVerbosity()))
+					                                cerr << getTime()
+					                                     << "RADIUS-PLUGIN: Write route string: push route "
+					                                     << framedip << " "
+					                                     << framednetmask
+					                                     << " to ccd-file.\n";
+
+					                        ccdfile << "push \"route "
+					                                << framedip << " "
+					                                << framednetmask
+					                                << "\"\n";
+					                }
+					        }
+
+					        route=strtok(NULL,";");
 					}
 				}
 			}
