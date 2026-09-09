@@ -1,3 +1,1777 @@
+# OpenVPN RADIUS Plugin – OpenVPN 2.7 Accounting, Terminate Cause and Framed-Route Support
+
+## Overview
+
+This fork extends the legacy `openvpn-auth-radius` plugin with functionality required for modern OpenVPN 2.7 installations.
+
+The original upstream project still contains much of the RADIUS accounting implementation in classes such as `UserAcct`, but the runtime accounting logic was removed from the OpenVPN plugin integration.
+
+This work restores and extends that functionality.
+
+The implementation provides:
+
+- RADIUS authentication
+- RADIUS Accounting-Start
+- RADIUS Accounting-Stop
+- Session duration accounting
+- Input/output traffic accounting
+- RADIUS Gigawords support for sessions exceeding 4 GB
+- Dynamic `Acct-Terminate-Cause`
+- Detection of:
+  - User-Request
+  - Lost-Carrier
+  - Idle-Timeout
+  - Session-Timeout
+- OpenVPN 2.7 `CLIENT_CONNECT`
+- OpenVPN 2.7 `CLIENT_DISCONNECT`
+- `Framed-Route` support using client-pushed routes
+- CIDR-to-netmask conversion
+- compatibility with simple and legacy `Framed-Route` formats
+- a lightweight OpenVPN termination reason monitor
+- systemd integration for the termination reason monitor
+
+The resulting design provides RADIUS accounting behavior similar to what is normally expected from dedicated NAS devices.
+
+---
+
+# 1. Architecture
+
+The complete accounting flow is:
+
+```text
+                     +-------------------+
+                     |    RADIUS Server  |
+                     |                   |
+                     | Authentication    |
+                     | Accounting        |
+                     +---------+---------+
+                               ^
+                               |
+                               | UDP 1812 / 1813
+                               |
+                     +---------+---------+
+                     | radiusplugin.so   |
+                     |                   |
+                     | AUTH              |
+                     | CLIENT_CONNECT    |
+                     | CLIENT_DISCONNECT |
+                     +---------+---------+
+                               ^
+                               |
+                               |
+                        +------+------+
+                        |   OpenVPN   |
+                        |    2.7.x    |
+                        +------+------+
+                               |
+             +-----------------+----------------+
+             |                                  |
+             | client session                   | OpenVPN log
+             |                                  |
+             v                                  v
+       VPN client                     openvpn-radius-reason-monitor
+                                               |
+                                               v
+                                   /run/openvpn-radius-reason/
+                                               |
+                                               v
+                                      radiusplugin.so
+                                               |
+                                               v
+                                  Acct-Terminate-Cause
+```
+
+The OpenVPN plugin handles authentication and accounting directly.
+
+A small helper process is used only for determining the exact session termination reason because OpenVPN's `CLIENT_DISCONNECT` plugin callback does not expose the internal OpenVPN shutdown reason.
+
+---
+
+# 2. Why a termination reason monitor is required
+
+OpenVPN knows why a client session is being terminated.
+
+For example, OpenVPN itself logs events such as:
+
+```text
+Inactivity timeout (--inactive), exiting
+SIGTERM[soft,inactive] received, client-instance exiting
+```
+
+or:
+
+```text
+SIGUSR1[soft,ping-restart] received
+```
+
+However, the environment passed to:
+
+```text
+OPENVPN_PLUGIN_CLIENT_DISCONNECT
+```
+
+contains information such as:
+
+```text
+username
+common_name
+untrusted_ip
+untrusted_port
+trusted_ip
+trusted_port
+ifconfig_pool_remote_ip
+time_duration
+bytes_received
+bytes_sent
+```
+
+but does not include:
+
+```text
+signal
+disconnect_reason
+terminate_reason
+```
+
+Therefore the plugin cannot distinguish between:
+
+```text
+normal user disconnect
+network loss
+idle timeout
+session timeout
+```
+
+using the `CLIENT_DISCONNECT` environment alone.
+
+The helper monitor solves this limitation.
+
+---
+
+# 3. RADIUS terminate cause mapping
+
+Only the termination reasons important for normal VPN accounting are implemented.
+
+| RADIUS value | RADIUS name | OpenVPN condition |
+|---:|---|---|
+| 1 | User-Request | Normal/default client disconnect |
+| 2 | Lost-Carrier | Ping restart, connection reset or transport failure |
+| 4 | Idle-Timeout | OpenVPN `--inactive` timeout |
+| 5 | Session-Timeout | OpenVPN session timeout |
+
+The plugin defaults to:
+
+```text
+Acct-Terminate-Cause = 1
+```
+
+which corresponds to:
+
+```text
+User-Request
+```
+
+If the monitor detects a more specific reason, that value overrides the default.
+
+---
+
+# 4. OpenVPN plugin event registration
+
+The legacy plugin originally registered only:
+
+```cpp
+OPENVPN_PLUGIN_AUTH_USER_PASS_VERIFY
+```
+
+The modified plugin registers:
+
+```cpp
+*type_mask =
+        OPENVPN_PLUGIN_MASK ( OPENVPN_PLUGIN_AUTH_USER_PASS_VERIFY ) |
+        OPENVPN_PLUGIN_MASK ( OPENVPN_PLUGIN_CLIENT_CONNECT ) |
+        OPENVPN_PLUGIN_MASK ( OPENVPN_PLUGIN_CLIENT_DISCONNECT );
+```
+
+This allows the plugin to receive events when a VPN session starts and stops.
+
+---
+
+# 5. Authentication
+
+Authentication remains handled by the existing plugin implementation.
+
+The plugin creates a `UserPlugin` object and associates the OpenVPN client with a key constructed from the client's remote address and port.
+
+Conceptually:
+
+```text
+CLIENT_IP:CLIENT_PORT
+```
+
+Example:
+
+```text
+REMOTE_IP:REMOTE_PORT
+```
+
+This key is stored in the internal user map.
+
+The same key is later used by `CLIENT_CONNECT` and `CLIENT_DISCONNECT` to retrieve the associated authenticated user.
+
+---
+
+# 6. Accounting-Start
+
+When OpenVPN executes:
+
+```text
+OPENVPN_PLUGIN_CLIENT_CONNECT
+```
+
+the plugin:
+
+1. obtains the client's remote IP
+2. obtains the client's remote port
+3. constructs the internal session key
+4. retrieves the authenticated `UserPlugin`
+5. creates a temporary `UserAcct` object
+6. copies the session information
+7. sets the assigned VPN IP
+8. sends a RADIUS Accounting-Start packet
+
+Conceptually:
+
+```text
+Authentication
+     |
+     v
+UserPlugin stored
+     |
+     v
+CLIENT_CONNECT
+     |
+     v
+UserAcct
+     |
+     v
+Accounting-Request
+Acct-Status-Type = Start
+```
+
+The Accounting-Start packet includes attributes such as:
+
+```text
+User-Name
+Framed-IP-Address
+NAS-Port
+Calling-Station-Id
+NAS-Identifier
+NAS-IP-Address
+NAS-Port-Type
+Service-Type
+Acct-Session-Id
+Acct-Status-Type = Start
+Framed-Protocol
+```
+
+---
+
+# 7. Accounting-Stop
+
+When OpenVPN executes:
+
+```text
+OPENVPN_PLUGIN_CLIENT_DISCONNECT
+```
+
+the callback contains useful session accounting information:
+
+```text
+time_duration
+bytes_received
+bytes_sent
+ifconfig_pool_remote_ip
+untrusted_ip
+untrusted_port
+username
+```
+
+The plugin reconstructs the appropriate `UserAcct` object and sends:
+
+```text
+Acct-Status-Type = Stop
+```
+
+The Accounting-Stop packet contains:
+
+```text
+User-Name
+Framed-IP-Address
+NAS-Port
+Calling-Station-Id
+NAS-Identifier
+NAS-IP-Address
+NAS-Port-Type
+Service-Type
+Acct-Session-Id
+Acct-Status-Type
+Framed-Protocol
+Acct-Input-Octets
+Acct-Output-Octets
+Acct-Session-Time
+Acct-Input-Gigawords
+Acct-Output-Gigawords
+Acct-Terminate-Cause
+```
+
+---
+
+# 8. Session duration
+
+OpenVPN provides:
+
+```text
+time_duration
+```
+
+during `CLIENT_DISCONNECT`.
+
+The existing `UserAcct::sendStopPacket()` implementation calculates:
+
+```cpp
+time(NULL) - starttime
+```
+
+Therefore the plugin reconstructs the original start time as:
+
+```cpp
+starttime = time(NULL) - time_duration;
+```
+
+The existing RADIUS packet generation code can then calculate the correct:
+
+```text
+Acct-Session-Time
+```
+
+---
+
+# 9. 64-bit traffic accounting
+
+OpenVPN exposes traffic counters that may exceed 32-bit integer limits.
+
+The plugin reads:
+
+```text
+bytes_received
+bytes_sent
+```
+
+using 64-bit integers.
+
+Example conceptually:
+
+```cpp
+uint64_t rx;
+uint64_t tx;
+```
+
+RADIUS traditionally represents large counters using:
+
+```text
+Acct-Input-Octets
+Acct-Input-Gigawords
+
+Acct-Output-Octets
+Acct-Output-Gigawords
+```
+
+The plugin splits the OpenVPN 64-bit counters accordingly.
+
+For received traffic:
+
+```cpp
+acct.setBytesIn(
+        (uint32_t)(rx & 0xffffffffULL)
+);
+
+acct.setGigaIn(
+        (uint32_t)(rx >> 32)
+);
+```
+
+For transmitted traffic:
+
+```cpp
+acct.setBytesOut(
+        (uint32_t)(tx & 0xffffffffULL)
+);
+
+acct.setGigaOut(
+        (uint32_t)(tx >> 32)
+);
+```
+
+This prevents accounting counters from wrapping after approximately 4 GB.
+
+---
+
+# 10. Dynamic Acct-Terminate-Cause
+
+A new accounting property was added to `UserAcct`.
+
+Conceptually:
+
+```cpp
+uint32_t terminatecause;
+```
+
+The default value is:
+
+```cpp
+terminatecause = 1;
+```
+
+corresponding to:
+
+```text
+User-Request
+```
+
+The class provides:
+
+```cpp
+uint32_t getTerminateCause(void);
+void setTerminateCause(uint32_t);
+```
+
+The value is preserved by:
+
+- constructor
+- copy constructor
+- assignment operator
+
+The Accounting-Stop packet now contains:
+
+```text
+Attribute 49
+Acct-Terminate-Cause
+```
+
+The RADIUS implementation already contains:
+
+```cpp
+#define ATTRIB_Acct_Terminate_Cause 49
+```
+
+and correctly encodes it as a four-byte integer RADIUS attribute.
+
+---
+
+# 11. Termination reason helper
+
+The helper is installed as:
+
+```text
+/usr/local/sbin/openvpn-radius-reason-monitor
+```
+
+A copy can also be stored in the source repository as:
+
+```text
+contrib/openvpn-radius-reason-monitor
+```
+
+The helper monitors:
+
+```text
+/var/log/openvpn/server.log
+```
+
+and looks only for actual termination events.
+
+It deliberately does NOT match generic configuration lines such as:
+
+```text
+Timers: ping 10, ping-restart 240, inactive 60, session-timeout ...
+```
+
+because those lines describe configuration and are not termination events.
+
+---
+
+# 12. Idle timeout detection
+
+OpenVPN produces messages similar to:
+
+```text
+Inactivity timeout (--inactive), exiting
+```
+
+followed by:
+
+```text
+SIGTERM[soft,inactive] received, client-instance exiting
+```
+
+The monitor maps these events to:
+
+```text
+4
+```
+
+which means:
+
+```text
+Idle-Timeout
+```
+
+---
+
+# 13. Session timeout detection
+
+OpenVPN generates a session termination event when the configured maximum session duration is reached.
+
+The monitor maps matching session timeout events to:
+
+```text
+5
+```
+
+which means:
+
+```text
+Session-Timeout
+```
+
+---
+
+# 14. Lost carrier detection
+
+Network failures commonly result in messages such as:
+
+```text
+ping-restart
+connection reset
+transport error
+```
+
+or corresponding OpenVPN soft signals.
+
+These events are mapped to:
+
+```text
+2
+```
+
+which means:
+
+```text
+Lost-Carrier
+```
+
+This has been tested by terminating the client's network connectivity without performing a normal VPN disconnect.
+
+---
+
+# 15. User-request detection
+
+A normal client disconnect usually does not create a specific reason file.
+
+The plugin therefore defaults to:
+
+```text
+1
+```
+
+which means:
+
+```text
+User-Request
+```
+
+This produces the expected behavior for normal client initiated disconnects.
+
+---
+
+# 16. Reason file transport
+
+The helper and plugin communicate through temporary files stored under:
+
+```text
+/run/openvpn-radius-reason/
+```
+
+The filename is generated from:
+
+```text
+CLIENT_IP_CLIENT_PORT
+```
+
+Conceptually:
+
+```text
+/run/openvpn-radius-reason/REMOTE_IP_REMOTE_PORT
+```
+
+The file contains one integer.
+
+Examples:
+
+```text
+1
+2
+4
+5
+```
+
+Using `/run` provides several advantages:
+
+- memory-backed on most Linux distributions
+- automatically cleaned at reboot
+- no unnecessary persistent disk writes
+- appropriate for runtime state
+- simple communication between independent processes
+
+---
+
+# 17. Race condition handling
+
+The termination event is written to the OpenVPN log immediately before the `CLIENT_DISCONNECT` plugin callback.
+
+There is therefore a small possibility that the plugin callback executes before the monitor has processed the log line.
+
+To handle this, the plugin performs several short retries.
+
+Conceptually:
+
+```text
+5 attempts
+20 ms delay
+maximum delay: approximately 100 ms
+```
+
+The logic is approximately:
+
+```text
+default reason = User-Request
+
+repeat several times:
+
+    if reason file exists:
+        read reason
+        delete file
+        stop retrying
+
+    sleep briefly
+```
+
+This delay occurs only during disconnect processing.
+
+---
+
+# 18. Reason file cleanup
+
+After successfully reading the reason file, the plugin deletes it.
+
+This is important because remote client source ports may eventually be reused.
+
+The normal sequence is:
+
+```text
+OpenVPN termination
+       |
+       v
+monitor detects reason
+       |
+       v
+reason file created
+       |
+       v
+CLIENT_DISCONNECT
+       |
+       v
+plugin reads reason
+       |
+       v
+plugin deletes file
+       |
+       v
+RADIUS Accounting-Stop
+```
+
+---
+
+# 19. Reason monitor example
+
+Example implementation:
+
+```python
+#!/usr/bin/env python3
+
+import os
+import re
+import time
+
+LOGFILE = "/var/log/openvpn/server.log"
+OUTDIR = "/run/openvpn-radius-reason"
+
+os.makedirs(OUTDIR, exist_ok=True)
+
+client_re = re.compile(
+    r'^[A-Za-z0-9_.@-]+/(?:tcp4-server|udp4|tcp6-server|udp6):'
+    r'(?P<ip>[0-9a-fA-F:.]+):(?P<port>[0-9]+)\s+'
+    r'(?P<msg>.*)$'
+)
+
+def map_reason(msg):
+    msg = msg.lower()
+
+    # 4 = Idle-Timeout
+    if "inactivity timeout (--inactive)" in msg:
+        return 4
+
+    if "sigterm[soft,inactive]" in msg:
+        return 4
+
+    if "sigusr1[soft,inactive]" in msg:
+        return 4
+
+    # 5 = Session-Timeout
+    if "session timeout" in msg and "exiting" in msg:
+        return 5
+
+    if "sigterm[soft,session-timeout]" in msg:
+        return 5
+
+    # 2 = Lost-Carrier
+    if "sigusr1[soft,ping-restart]" in msg:
+        return 2
+
+    if "sigterm[soft,ping-restart]" in msg:
+        return 2
+
+    if "connection reset" in msg:
+        return 2
+
+    if "transport error" in msg:
+        return 2
+
+    return None
+
+
+def write_reason(ip, port, reason):
+    safe_ip = ip.replace(":", "_")
+
+    path = os.path.join(
+        OUTDIR,
+        f"{safe_ip}_{port}"
+    )
+
+    tmp = path + ".tmp"
+
+    with open(tmp, "w") as f:
+        f.write(str(reason) + "\n")
+
+    os.replace(tmp, path)
+
+    print(
+        f"reason={reason} client={ip}:{port} file={path}",
+        flush=True
+    )
+
+
+with open(LOGFILE, "r") as f:
+
+    # Ignore historical log entries.
+    f.seek(0, os.SEEK_END)
+
+    while True:
+        line = f.readline()
+
+        if not line:
+            time.sleep(0.05)
+            continue
+
+        line = line.rstrip()
+
+        match = client_re.match(line)
+
+        if not match:
+            continue
+
+        reason = map_reason(
+            match.group("msg")
+        )
+
+        if reason is None:
+            continue
+
+        write_reason(
+            match.group("ip"),
+            match.group("port"),
+            reason
+        )
+```
+
+---
+
+# 20. systemd service
+
+Example:
+
+```ini
+[Unit]
+Description=OpenVPN RADIUS terminate reason monitor
+After=network.target openvpn-server@server.service
+Wants=openvpn-server@server.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/openvpn-radius-reason-monitor
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Install:
+
+```bash
+cp openvpn-radius-reason-monitor \
+   /usr/local/sbin/openvpn-radius-reason-monitor
+
+chmod 755 \
+   /usr/local/sbin/openvpn-radius-reason-monitor
+```
+
+Install the service:
+
+```bash
+cp openvpn-radius-reason-monitor.service \
+   /etc/systemd/system/
+```
+
+Enable it:
+
+```bash
+systemctl daemon-reload
+
+systemctl enable --now \
+    openvpn-radius-reason-monitor.service
+```
+
+Check:
+
+```bash
+systemctl status \
+    openvpn-radius-reason-monitor.service
+```
+
+Logs:
+
+```bash
+journalctl \
+    -u openvpn-radius-reason-monitor.service \
+    -f
+```
+
+---
+
+# 21. OpenVPN logging requirement
+
+The termination monitor requires an OpenVPN log file.
+
+Example server configuration:
+
+```conf
+log-append /var/log/openvpn/server.log
+```
+
+Create the directory if required:
+
+```bash
+mkdir -p /var/log/openvpn
+```
+
+Restart OpenVPN after changing the configuration.
+
+---
+
+# 22. OpenVPN plugin configuration
+
+Example:
+
+```conf
+plugin /usr/local/lib/openvpn/radiusplugin.so /etc/openvpn/radiusplugin.cnf
+```
+
+The plugin configuration must contain the RADIUS accounting port.
+
+Example:
+
+```conf
+NAS-Identifier=OpenVPN
+Service-Type=5
+Framed-Protocol=1
+NAS-Port-Type=5
+NAS-IP-Address=127.0.0.1
+
+OpenVPNConfig=/etc/openvpn/server/server.conf
+
+subnet=255.255.255.0
+overwriteccfiles=true
+
+server
+{
+    name=RADIUS_SERVER
+    authport=1812
+    acctport=1813
+    retry=1
+    wait=1
+    sharedsecret=RADIUS_SHARED_SECRET
+}
+```
+
+Replace:
+
+```text
+RADIUS_SERVER
+RADIUS_SHARED_SECRET
+```
+
+with environment-specific values.
+
+---
+
+# 23. Avoid duplicate accounting
+
+Do not use external `client-connect` and `client-disconnect` accounting scripts at the same time as native plugin accounting.
+
+Otherwise both implementations may send:
+
+```text
+Accounting-Start
+Accounting-Stop
+```
+
+for the same VPN session.
+
+This can result in duplicate `radacct` records.
+
+Any old accounting scripts used during migration should therefore be disabled once the native plugin implementation is confirmed operational.
+
+---
+
+# 24. OpenVPN timeout configuration
+
+Typical configuration may include:
+
+```conf
+inactive 600
+session-timeout 28800
+```
+
+Example meanings:
+
+```text
+inactive 600
+```
+
+Disconnects a client after 600 seconds of inactivity.
+
+```text
+session-timeout 28800
+```
+
+Limits a VPN session to eight hours.
+
+These values are only examples and should be adjusted for the environment.
+
+For testing, very short values such as 60 seconds can be used temporarily.
+
+---
+
+# 25. Framed-Route support
+
+The fork also modifies the handling of the RADIUS:
+
+```text
+Framed-Route
+```
+
+attribute.
+
+The original behavior was unsuitable for the required client-side routing use case.
+
+The new implementation generates OpenVPN pushed routes.
+
+For example, a RADIUS attribute:
+
+```text
+Framed-Route = 10.20.0.0/16
+```
+
+generates:
+
+```conf
+push "route 10.20.0.0 255.255.0.0"
+```
+
+in the generated client configuration.
+
+---
+
+# 26. Supported Framed-Route syntax
+
+Simple CIDR syntax is supported:
+
+```text
+10.20.0.0/16
+```
+
+Legacy RADIUS-style syntax is also accepted:
+
+```text
+10.20.0.0/16 10.0.0.1/32 1
+```
+
+Only the first network/prefix component is used.
+
+Anything following the network prefix is ignored.
+
+This preserves compatibility with RADIUS databases containing legacy route formatting.
+
+---
+
+# 27. Framed-Route validation
+
+The route parser validates:
+
+```text
+IPv4 network address
+CIDR prefix
+```
+
+CIDR must be:
+
+```text
+0 ... 32
+```
+
+Invalid values are rejected and logged.
+
+Examples of invalid values:
+
+```text
+10.20.0.0/40
+invalid-address/24
+```
+
+The implementation uses:
+
+```cpp
+inet_pton(AF_INET, ...)
+```
+
+to validate IPv4 addresses.
+
+---
+
+# 28. CIDR conversion
+
+The plugin converts the CIDR prefix into a dotted IPv4 netmask.
+
+Examples:
+
+```text
+/8  -> 255.0.0.0
+/16 -> 255.255.0.0
+/24 -> 255.255.255.0
+/32 -> 255.255.255.255
+```
+
+The generated OpenVPN configuration therefore uses standard route syntax:
+
+```conf
+push "route NETWORK NETMASK"
+```
+
+rather than requiring the OpenVPN client to interpret CIDR notation.
+
+---
+
+# 29. Building the plugin
+
+From the project directory:
+
+```bash
+make clean
+make
+```
+
+Successful compilation produces:
+
+```text
+radiusplugin.so
+```
+
+Example verification:
+
+```bash
+file radiusplugin.so
+```
+
+Expected architecture depends on the build system, for example:
+
+```text
+ELF 64-bit LSB shared object, x86-64
+```
+
+Install:
+
+```bash
+cp radiusplugin.so \
+   /usr/local/lib/openvpn/radiusplugin.so
+
+chmod 755 \
+   /usr/local/lib/openvpn/radiusplugin.so
+```
+
+---
+
+# 30. Recommended safe upgrade procedure
+
+Do not overwrite the currently working plugin immediately.
+
+Install a test copy first:
+
+```bash
+cp radiusplugin.so \
+   /usr/local/lib/openvpn/radiusplugin-test.so
+```
+
+Update OpenVPN temporarily:
+
+```conf
+plugin /usr/local/lib/openvpn/radiusplugin-test.so /etc/openvpn/radiusplugin.cnf
+```
+
+Restart:
+
+```bash
+systemctl restart openvpn-server@server
+```
+
+Verify:
+
+```bash
+systemctl status openvpn-server@server
+```
+
+Only after all tests succeed should the normal production plugin filename be replaced.
+
+---
+
+# 31. Accounting verification
+
+A typical FreeRADIUS SQL schema stores sessions in:
+
+```text
+radacct
+```
+
+Useful test query:
+
+```sql
+SELECT
+    radacctid,
+    username,
+    acctsessionid,
+    framedipaddress,
+    acctstarttime,
+    acctstoptime,
+    acctsessiontime,
+    acctinputoctets,
+    acctoutputoctets,
+    acctterminatecause
+FROM radacct
+ORDER BY radacctid DESC
+LIMIT 10;
+```
+
+---
+
+# 32. Expected active session
+
+After successful VPN connection, before disconnect:
+
+```text
+acctstarttime       = populated
+acctstoptime        = NULL
+acctsessiontime     = 0 or not final
+```
+
+This confirms:
+
+```text
+Accounting-Start
+```
+
+has been received.
+
+---
+
+# 33. Expected completed session
+
+After disconnect:
+
+```text
+acctstarttime       = populated
+acctstoptime        = populated
+acctsessiontime     > 0
+acctinputoctets     >= 0
+acctoutputoctets    >= 0
+acctterminatecause  = populated
+```
+
+This confirms:
+
+```text
+Accounting-Stop
+```
+
+has been received.
+
+---
+
+# 34. Test matrix
+
+The following scenarios were used to validate the implementation.
+
+## Normal client disconnect
+
+Action:
+
+```text
+Connect VPN
+Generate traffic
+Disconnect normally
+```
+
+Expected:
+
+```text
+Acct-Terminate-Cause = User-Request
+```
+
+---
+
+## Lost network connectivity
+
+Action:
+
+```text
+Connect VPN
+Disable network adapter / disconnect physical network
+Wait for OpenVPN connection failure
+```
+
+Expected:
+
+```text
+Acct-Terminate-Cause = Lost-Carrier
+```
+
+---
+
+## Idle timeout
+
+Configure:
+
+```conf
+inactive TEST_VALUE
+```
+
+Connect without generating meaningful VPN traffic.
+
+Expected OpenVPN event:
+
+```text
+Inactivity timeout (--inactive)
+```
+
+Expected RADIUS result:
+
+```text
+Acct-Terminate-Cause = Idle-Timeout
+```
+
+---
+
+## Session timeout
+
+Configure a short temporary:
+
+```conf
+session-timeout TEST_VALUE
+```
+
+Wait until the maximum session duration is reached.
+
+Expected:
+
+```text
+Acct-Terminate-Cause = Session-Timeout
+```
+
+---
+
+## Framed-Route
+
+Configure a RADIUS reply attribute such as:
+
+```text
+Framed-Route = 10.20.0.0/16
+```
+
+Expected OpenVPN pushed route:
+
+```text
+route 10.20.0.0 255.255.0.0
+```
+
+---
+
+# 35. Confirmed termination mapping
+
+The following mappings were tested successfully:
+
+```text
+User-Request     -> 1
+Lost-Carrier     -> 2
+Idle-Timeout     -> 4
+Session-Timeout  -> 5
+```
+
+These values are standard RADIUS `Acct-Terminate-Cause` values.
+
+---
+
+# 36. Acct-Interim-Interval
+
+The legacy source code contains support for:
+
+```text
+Acct-Interim-Interval
+```
+
+and may log:
+
+```text
+No attributes Acct Interim Interval or bad length.
+```
+
+This does not prevent:
+
+```text
+Accounting-Start
+Accounting-Stop
+```
+
+from working.
+
+The restored implementation described here focuses on:
+
+```text
+Start
+Stop
+Terminate Cause
+```
+
+Periodic Interim-Update accounting is not part of the restored runtime accounting path described in this document.
+
+It may be implemented separately if required.
+
+---
+
+# 37. Security considerations
+
+The reason monitor does not communicate with the RADIUS server directly.
+
+It only:
+
+```text
+reads OpenVPN log
+maps known termination reasons
+writes a small runtime file
+```
+
+The RADIUS shared secret remains accessible only to the RADIUS plugin configuration.
+
+The runtime reason directory should not be writable by untrusted users.
+
+Recommended permissions should restrict access according to the OpenVPN service account and system design.
+
+---
+
+# 38. Log rotation
+
+Because the monitor follows:
+
+```text
+/var/log/openvpn/server.log
+```
+
+log rotation should be configured carefully.
+
+A production deployment should ensure that the monitor correctly handles log rotation or is restarted after OpenVPN log rotation.
+
+A simple deployment can use systemd to restart the monitor when required.
+
+For high-volume installations, a more advanced file-following implementation may be desirable.
+
+---
+
+# 39. Runtime dependency
+
+For correct non-default `Acct-Terminate-Cause`, both components must be operational:
+
+```text
+radiusplugin.so
+openvpn-radius-reason-monitor
+```
+
+If the monitor is unavailable, VPN authentication and accounting still work.
+
+However, sessions without a detected reason will fall back to:
+
+```text
+User-Request
+```
+
+because that is the plugin's safe default.
+
+---
+
+# 40. Failure behavior
+
+Accounting failures are deliberately prevented from rejecting an already authenticated VPN connection.
+
+For example, if the RADIUS accounting server temporarily fails during:
+
+```text
+Accounting-Start
+```
+
+the plugin logs the failure but does not reject the established user solely because accounting failed.
+
+Similarly, disconnect processing continues even if the RADIUS Accounting-Stop request cannot be delivered.
+
+This prevents accounting availability from becoming an unnecessary VPN availability dependency.
+
+---
+
+# 41. Debugging
+
+Useful OpenVPN logs:
+
+```bash
+journalctl -u openvpn-server@server -f
+```
+
+Useful plugin messages include:
+
+```text
+OPENVPN_PLUGIN_CLIENT_CONNECT called
+ACCOUNTING-START succeeded
+OPENVPN_PLUGIN_CLIENT_DISCONNECT called
+terminate-cause=X
+ACCOUNTING-STOP succeeded
+```
+
+Monitor logs:
+
+```bash
+journalctl \
+    -u openvpn-radius-reason-monitor.service \
+    -f
+```
+
+Example monitor message:
+
+```text
+reason=4 client=REMOTE_IP:REMOTE_PORT file=/run/openvpn-radius-reason/REMOTE_IP_REMOTE_PORT
+```
+
+---
+
+# 42. Checking runtime reason files
+
+Normally reason files exist only for a very short time because the plugin consumes and deletes them.
+
+For debugging:
+
+```bash
+find /run/openvpn-radius-reason \
+    -maxdepth 1 \
+    -type f \
+    -print
+```
+
+A file may disappear almost immediately after creation.
+
+This is expected.
+
+The normal sequence is:
+
+```text
+monitor creates file
+plugin reads file
+plugin unlinks file
+```
+
+---
+
+# 43. Repository organization
+
+A useful repository structure is:
+
+```text
+openvpn-auth-radius/
+├── radiusplugin.cpp
+├── radiusplugin.h
+├── UserAcct.cpp
+├── UserAcct.h
+├── UserAuth.cpp
+├── RadiusClass/
+├── contrib/
+│   ├── openvpn-radius-reason-monitor
+│   └── systemd/
+│       └── openvpn-radius-reason-monitor.service
+└── README.md
+```
+
+---
+
+# 44. Main source modifications
+
+The relevant source changes are concentrated in:
+
+```text
+radiusplugin.cpp
+UserAcct.cpp
+UserAcct.h
+UserAuth.cpp
+```
+
+### radiusplugin.cpp
+
+Adds:
+
+```text
+CLIENT_CONNECT event handling
+CLIENT_DISCONNECT event handling
+Accounting-Start
+Accounting-Stop
+reason file lookup
+dynamic terminate cause assignment
+```
+
+### UserAcct.h
+
+Adds:
+
+```text
+terminatecause property
+getTerminateCause()
+setTerminateCause()
+```
+
+### UserAcct.cpp
+
+Adds:
+
+```text
+terminate cause initialization
+copy support
+Acct-Terminate-Cause attribute in Accounting-Stop
+```
+
+### UserAuth.cpp
+
+Changes:
+
+```text
+Framed-Route parsing
+CIDR conversion
+client pushed routes
+```
+
+---
+
+# 45. Design rationale
+
+Several design decisions were made intentionally.
+
+## No OpenVPN binary patch
+
+OpenVPN itself was not modified.
+
+Maintaining a custom OpenVPN package would introduce significant upgrade and maintenance overhead.
+
+The helper monitor allows the standard distribution OpenVPN package to remain unchanged.
+
+---
+
+## No journal parsing inside the plugin
+
+The OpenVPN plugin does not invoke:
+
+```text
+journalctl
+```
+
+and does not parse system logs itself.
+
+This keeps the plugin small and avoids:
+
+- spawning external commands
+- systemd dependency inside plugin code
+- blocking process execution
+- complex log parsing inside OpenVPN callbacks
+
+---
+
+## Runtime files instead of database communication
+
+The helper monitor does not update SQL or RADIUS directly.
+
+It only writes a tiny reason code.
+
+This keeps responsibilities separated:
+
+```text
+monitor -> determine reason
+plugin  -> RADIUS accounting
+```
+
+---
+
+## Default User-Request
+
+If no specific shutdown reason can be detected, the plugin uses:
+
+```text
+User-Request
+```
+
+rather than inventing a more specific cause.
+
+This avoids reporting false `Lost-Carrier`, `Idle-Timeout`, or `Session-Timeout` values.
+
+---
+
+# 46. Current feature status
+
+Working and tested:
+
+```text
+[OK] RADIUS authentication
+[OK] Accounting-Start
+[OK] Accounting-Stop
+[OK] Acct-Session-Time
+[OK] Acct-Input-Octets
+[OK] Acct-Output-Octets
+[OK] Acct-Input-Gigawords
+[OK] Acct-Output-Gigawords
+[OK] Acct-Terminate-Cause
+[OK] User-Request
+[OK] Lost-Carrier
+[OK] Idle-Timeout
+[OK] Session-Timeout
+[OK] Framed-Route
+[OK] CIDR route parsing
+[OK] OpenVPN 2.7 CLIENT_CONNECT
+[OK] OpenVPN 2.7 CLIENT_DISCONNECT
+[OK] systemd reason monitor
+```
+
+Not implemented as part of this work:
+
+```text
+[ ] restored background Interim-Update scheduler
+[ ] full NAS reboot/admin termination classification
+[ ] direct OpenVPN API termination-reason callback
+```
+
+The last item depends on information exposed by OpenVPN itself.
+
+---
+
+# 47. Summary
+
+This implementation restores RADIUS accounting functionality to the legacy OpenVPN RADIUS plugin while adapting it for OpenVPN 2.7.
+
+The final session flow is:
+
+```text
+RADIUS Access-Request
+        |
+        v
+RADIUS Access-Accept
+        |
+        v
+OpenVPN authentication succeeds
+        |
+        v
+CLIENT_CONNECT
+        |
+        v
+RADIUS Accounting-Start
+        |
+        v
+VPN session
+        |
+        +-----------------------------+
+        |                             |
+        | OpenVPN detects termination |
+        |                             |
+        +-------------+---------------+
+                      |
+                      v
+           termination reason monitor
+                      |
+                      v
+              runtime reason file
+                      |
+                      v
+               CLIENT_DISCONNECT
+                      |
+                      v
+            RADIUS Accounting-Stop
+                      |
+                      v
+              FreeRADIUS / SQL
+                      |
+                      v
+             accounting interface
+```
+
+The result is complete per-session accounting with the four termination causes most relevant for VPN operation:
+
+```text
+User-Request
+Lost-Carrier
+Idle-Timeout
+Session-Timeout
+```
+
+while preserving RADIUS authentication and adding corrected `Framed-Route` handling for client-pushed routes.
+
+############################################################################################################################################################
+FROM this line below is original from mainteiner
 /*
  *  radiusplugin -- An OpenVPN plugin for do radius authentication.
  * 
