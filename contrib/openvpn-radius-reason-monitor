@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+
+import os
+import re
+import time
+
+LOGFILE = "/var/log/openvpn/server.log"
+OUTDIR = "/run/openvpn-radius-reason"
+
+os.makedirs(OUTDIR, exist_ok=True)
+
+client_re = re.compile(
+    r'^[A-Za-z0-9_.@-]+/(?:tcp4-server|udp4|tcp6-server|udp6):'
+    r'(?P<ip>[0-9a-fA-F:.]+):(?P<port>[0-9]+)\s+'
+    r'(?P<msg>.*)$'
+)
+
+def map_reason(msg):
+    m = msg.lower()
+
+    # 4 = Idle-Timeout
+    if "inactivity timeout (--inactive)" in m:
+        return 4
+
+    if "sigterm[soft,inactive]" in m:
+        return 4
+
+    if "sigusr1[soft,inactive]" in m:
+        return 4
+
+    # 5 = Session-Timeout
+    if "session timeout" in m and "exiting" in m:
+        return 5
+
+    if "sigterm[soft,session-timeout]" in m:
+        return 5
+
+    # 2 = Lost-Carrier
+    if "sigusr1[soft,ping-restart]" in m:
+        return 2
+
+    if "sigterm[soft,ping-restart]" in m:
+        return 2
+
+    if "connection reset" in m:
+        return 2
+
+    if "connection reset by peer" in m:
+        return 2
+
+    if "transport error" in m:
+        return 2
+
+    return None
+
+
+def write_reason(ip, port, reason):
+    safe_ip = ip.replace(":", "_")
+    path = os.path.join(
+        OUTDIR,
+        f"{safe_ip}_{port}"
+    )
+
+    tmp = path + ".tmp"
+
+    with open(tmp, "w") as f:
+        f.write(str(reason) + "\n")
+
+    os.replace(tmp, path)
+
+    print(
+        f"reason={reason} client={ip}:{port} file={path}",
+        flush=True
+    )
+
+
+with open(LOGFILE, "r") as f:
+    f.seek(0, os.SEEK_END)
+
+    while True:
+        line = f.readline()
+
+        if not line:
+            time.sleep(0.05)
+            continue
+
+        line = line.rstrip()
+
+        match = client_re.match(line)
+
+        if not match:
+            continue
+
+        reason = map_reason(match.group("msg"))
+
+        if reason is None:
+            continue
+
+        write_reason(
+            match.group("ip"),
+            match.group("port"),
+            reason
+        )

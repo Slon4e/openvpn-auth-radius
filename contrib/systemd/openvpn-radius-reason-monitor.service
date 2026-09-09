@@ -1,0 +1,13 @@
+[Unit]
+Description=OpenVPN RADIUS terminate reason monitor
+After=network.target openvpn-server@server.service
+Wants=openvpn-server@server.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/openvpn-radius-reason-monitor
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
