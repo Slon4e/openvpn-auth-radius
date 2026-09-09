@@ -71,7 +71,10 @@ extern "C"
 
 
 		// Intercept the --auth-user-pass-verify, --client-connect and --client-disconnect callback.
-		*type_mask = OPENVPN_PLUGIN_MASK ( OPENVPN_PLUGIN_AUTH_USER_PASS_VERIFY );
+		*type_mask =
+		        OPENVPN_PLUGIN_MASK ( OPENVPN_PLUGIN_AUTH_USER_PASS_VERIFY ) |
+		        OPENVPN_PLUGIN_MASK ( OPENVPN_PLUGIN_CLIENT_CONNECT ) |
+		        OPENVPN_PLUGIN_MASK ( OPENVPN_PLUGIN_CLIENT_DISCONNECT );
 
 		// Get verbosity level from the environment.
 		const char *verb_string = get_env ( "verb", envp );
@@ -400,8 +403,117 @@ extern "C"
 
 			}
 			return OPENVPN_PLUGIN_FUNC_ERROR;
-			/////////////////////////// CLIENT_CONNECT
 		}
+
+                /////////////////////////// CLIENT_CONNECT
+
+                if ( type == OPENVPN_PLUGIN_CLIENT_CONNECT )
+                {
+                        if ( DEBUG ( context->getVerbosity() ) )
+                        {
+                                cerr << getTime()
+                                     << "RADIUS-PLUGIN: OPENVPN_PLUGIN_CLIENT_CONNECT called.\n";
+                        }
+
+                        try
+                        {
+                                const char *client_ip =
+                                        get_env ( "untrusted_ip", envp );
+
+                                if ( client_ip == NULL )
+                                        client_ip =
+                                                get_env ( "untrusted_ip6", envp );
+
+                                const char *client_port =
+                                        get_env ( "untrusted_port", envp );
+
+                                const char *vpn_ip =
+                                        get_env ( "ifconfig_pool_remote_ip", envp );
+
+                                if ( client_ip == NULL )
+                                        throw Exception (
+                                                "RADIUS-PLUGIN: ACCOUNTING-START: client IP missing\n"
+                                        );
+
+                                if ( client_port == NULL )
+                                        throw Exception (
+                                                "RADIUS-PLUGIN: ACCOUNTING-START: client port missing\n"
+                                        );
+
+                                string key =
+                                        string ( client_ip ) +
+                                        string ( ":" ) +
+                                        string ( client_port );
+
+                                UserPlugin *acctuser =
+                                        context->findUser ( key );
+
+                                if ( acctuser == NULL )
+                                        throw Exception (
+                                                "RADIUS-PLUGIN: ACCOUNTING-START: user not found\n"
+                                        );
+
+                                UserAcct acct;
+
+                                acct.setUsername (
+                                        acctuser->getUsername()
+                                );
+
+                                acct.setCallingStationId (
+                                        acctuser->getCallingStationId()
+                                );
+
+                                acct.setPortnumber (
+                                        acctuser->getPortnumber()
+                                );
+
+                                acct.setSessionId (
+                                        acctuser->getSessionId()
+                                );
+
+                                if ( vpn_ip != NULL )
+                                        acct.setFramedIp (
+                                                string ( vpn_ip )
+                                        );
+                                else
+                                        acct.setFramedIp (
+                                                acctuser->getFramedIp()
+                                        );
+
+                                acct.setStarttime ( time ( NULL ) );
+
+                                if ( acct.sendStartPacket ( context ) != 0 )
+                                {
+                                        cerr << getTime()
+                                             << "RADIUS-PLUGIN: ACCOUNTING-START failed for "
+                                             << acctuser->getUsername()
+                                             << "\n";
+                                }
+                                else
+                                {
+                                        acctuser->setAccounted ( true );
+
+                                        if ( DEBUG ( context->getVerbosity() ) )
+                                        {
+                                                cerr << getTime()
+                                                     << "RADIUS-PLUGIN: ACCOUNTING-START succeeded for "
+                                                     << acctuser->getUsername()
+                                                     << "\n";
+                                        }
+                                }
+                        }
+                        catch ( Exception &e )
+                        {
+                                cerr << getTime() << e;
+                        }
+                        catch ( ... )
+                        {
+                                cerr << getTime()
+                                     << "RADIUS-PLUGIN: ACCOUNTING-START unknown exception\n";
+                        }
+
+                        return OPENVPN_PLUGIN_FUNC_SUCCESS;
+                }
 
 		return OPENVPN_PLUGIN_FUNC_ERROR;
 	}
