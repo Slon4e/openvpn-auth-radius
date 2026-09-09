@@ -448,7 +448,8 @@ int UserAcct::sendStopPacket(PluginContext * context)
 				ra13(ATTRIB_Acct_Output_Octets, this->bytesout),
 				ra14(ATTRIB_Acct_Session_Time),
 				ra15(ATTRIB_Acct_Input_Gigawords, this->gigain),
-				ra16(ATTRIB_Acct_Output_Gigawords, this->gigaout);				
+				ra16(ATTRIB_Acct_Output_Gigawords, this->gigaout),
+				ra17(ATTRIB_Acct_Terminate_Cause, string("1"));
 	
 	
 		
@@ -550,6 +551,11 @@ int UserAcct::sendStopPacket(PluginContext * context)
 	if (packet.addRadiusAttribute(&ra14)) {
 		cerr << getTime() << "RADIUS-PLUGIN: BACKGROUND-ACCT:  Fail to add attribute ATTRIB_Acct_Session_Time.\n";
 	}
+
+    if (packet.addRadiusAttribute(&ra17))
+    {
+            cerr << getTime() << "RADIUS-PLUGIN: BACKGROUND-ACCT:  Fail to add attribute ATTRIB_Acct_Terminate_Cause.\n";
+    }
 
 	if (packet.addRadiusAttribute(&ra15)) {
 		cerr << getTime() << "RADIUS-PLUGIN: BACKGROUND-ACCT:  Fail to add attribute ATTRIB_Acct_Input_Gigawords.\n";
