@@ -32,6 +32,7 @@ UserAcct::UserAcct():User()
 	bytesout=0;
 	nextupdate=0;
 	starttime=0;
+	terminatecause=1;
 }
 
 /** The destructor. Nothing happens here.*/
@@ -53,6 +54,7 @@ UserAcct & UserAcct::operator=(const UserAcct &u)
 		this->bytesout=u.bytesout;
 		this->nextupdate=u.nextupdate;
 		this->starttime=u.starttime;
+		this->terminatecause=u.terminatecause;
 	}
 	return *this;
 }
@@ -71,6 +73,7 @@ UserAcct::UserAcct(const UserAcct &u):User(u)
 	this->bytesout=u.bytesout;
 	this->nextupdate=u.nextupdate;
 	this->starttime=u.starttime;
+	this->terminatecause=u.terminatecause;
 	
 }
 
@@ -95,6 +98,17 @@ UserAcct::UserAcct(const UserAcct &u):User(u)
  * - Acct_Output_Gigawords
  * @param context The context of the plugin.
  * @return An integer, 0 is everything is ok, else 1.*/
+uint32_t UserAcct::getTerminateCause(void)
+{
+     return this->terminatecause;
+}
+
+void UserAcct::setTerminateCause(uint32_t terminatecause)
+{
+     this->terminatecause=terminatecause;
+}
+
+
 int UserAcct::sendUpdatePacket(PluginContext *context)
 {
 	
@@ -449,7 +463,7 @@ int UserAcct::sendStopPacket(PluginContext * context)
 				ra14(ATTRIB_Acct_Session_Time),
 				ra15(ATTRIB_Acct_Input_Gigawords, this->gigain),
 				ra16(ATTRIB_Acct_Output_Gigawords, this->gigaout),
-				ra17(ATTRIB_Acct_Terminate_Cause, string("1"));
+				ra17(ATTRIB_Acct_Terminate_Cause);
 	
 	
 		
@@ -551,6 +565,16 @@ int UserAcct::sendStopPacket(PluginContext * context)
 	if (packet.addRadiusAttribute(&ra14)) {
 		cerr << getTime() << "RADIUS-PLUGIN: BACKGROUND-ACCT:  Fail to add attribute ATTRIB_Acct_Session_Time.\n";
 	}
+
+    char terminatecause_str[16];
+    snprintf(
+            terminatecause_str,
+            sizeof(terminatecause_str),
+            "%u",
+            this->getTerminateCause()
+    );
+
+    ra17.setValue(terminatecause_str);
 
     if (packet.addRadiusAttribute(&ra17))
     {

@@ -684,6 +684,73 @@ extern "C"
                                              << "\n";
                                 }
 
+
+                                uint32_t terminate_cause = 1;
+
+                                {
+                                        char reason_path[512];
+
+                                        snprintf(
+                                                reason_path,
+                                                sizeof(reason_path),
+                                                "/run/openvpn-radius-reason/%s_%s",
+                                                client_ip,
+                                                client_port
+                                        );
+
+                                        for ( int reason_try = 0;
+                                              reason_try < 5;
+                                              reason_try++ )
+                                        {
+                                                FILE *reason_file =
+                                                        fopen(
+                                                                reason_path,
+                                                                "r"
+                                                        );
+
+                                                if ( reason_file != NULL )
+                                                {
+                                                        unsigned int reason_value = 1;
+
+                                                        if (
+                                                                fscanf(
+                                                                        reason_file,
+                                                                        "%u",
+                                                                        &reason_value
+                                                                ) == 1
+                                                        )
+                                                        {
+                                                                if (
+                                                                        reason_value >= 1 &&
+                                                                        reason_value <= 22
+                                                                )
+                                                                {
+                                                                        terminate_cause =
+                                                                                reason_value;
+                                                                }
+                                                        }
+
+                                                        fclose(reason_file);
+                                                        unlink(reason_path);
+                                                        break;
+                                                }
+
+                                                usleep(20000);
+                                        }
+                                }
+
+                                acct.setTerminateCause(
+                                        terminate_cause
+                                );
+
+                                if ( DEBUG ( context->getVerbosity() ) )
+                                {
+                                        cerr << getTime()
+                                             << "RADIUS-PLUGIN: terminate-cause="
+                                             << terminate_cause
+                                             << "\n";
+                                }
+
                                 if ( acct.sendStopPacket ( context ) != 0 )
                                 {
                                         cerr << getTime()

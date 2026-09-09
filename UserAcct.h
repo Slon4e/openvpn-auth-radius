@@ -44,6 +44,7 @@ private:
 	uint32_t bytesout;		/**< The sent bytes.*/
 	time_t nextupdate;		/**< The next update time.*/
 	time_t starttime;		/**< The start time of the connection.*/
+	uint32_t terminatecause;        /**< RADIUS Acct-Terminate-Cause.*/
 	
 public:
 	
@@ -69,6 +70,9 @@ public:
 	
 	time_t getStarttime(void);
 	void setStarttime(time_t);
+
+	uint32_t getTerminateCause(void);
+	void setTerminateCause(uint32_t);
 	
 	time_t getNextUpdate(void);
 	void setNextUpdate(time_t);
