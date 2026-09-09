@@ -1,3 +1,37 @@
+## Additional OpenVPN 2.7 Accounting Work
+
+This branch contains the standalone `Framed-Route` handling fix.
+
+A more complete branch is also available:
+
+`fix/openvpn-27-accounting`
+
+That branch includes this `Framed-Route` improvement together with restored and extended RADIUS accounting support for modern OpenVPN 2.7 installations.
+
+It adds:
+
+- RADIUS Accounting-Start
+- RADIUS Accounting-Stop
+- Acct-Session-Time
+- Input/output byte accounting
+- RADIUS Gigawords support
+- Acct-Terminate-Cause
+- User-Request
+- Lost-Carrier
+- Idle-Timeout
+- Session-Timeout
+- OpenVPN CLIENT_CONNECT support
+- OpenVPN CLIENT_DISCONNECT support
+- OpenVPN termination reason monitor
+- systemd service for termination reason detection
+- the same improved Framed-Route handling contained in this branch
+
+For users who need both improved route handling and RADIUS accounting, use:
+
+`fix/openvpn-27-accounting`
+
+The `fix/framed-route-push` branch is intentionally kept separate as a minimal Framed-Route-only change.
+
 # Slon4e fork — improved Framed-Route handling for OpenVPN remote-access clients
 
 This fork contains an improvement to the handling of the RADIUS `Framed-Route` attribute in `openvpn-auth-radius`, primarily intended for OpenVPN remote-access deployments using daloRADIUS as the frontend for FreeRADIUS.
