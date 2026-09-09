@@ -515,6 +515,211 @@ extern "C"
                         return OPENVPN_PLUGIN_FUNC_SUCCESS;
                 }
 
+
+                /////////////////////////// CLIENT_DISCONNECT
+
+                if ( type == OPENVPN_PLUGIN_CLIENT_DISCONNECT )
+                {
+                        if ( DEBUG ( context->getVerbosity() ) )
+                        {
+                                cerr << getTime()
+                                     << "RADIUS-PLUGIN: OPENVPN_PLUGIN_CLIENT_DISCONNECT called.\n";
+                        }
+
+                        try
+                        {
+                                const char *client_ip =
+                                        get_env ( "untrusted_ip", envp );
+
+                                if ( client_ip == NULL )
+                                {
+                                        client_ip =
+                                                get_env ( "untrusted_ip6", envp );
+                                }
+
+                                const char *client_port =
+                                        get_env ( "untrusted_port", envp );
+
+                                const char *vpn_ip =
+                                        get_env ( "ifconfig_pool_remote_ip", envp );
+
+                                const char *rx_string =
+                                        get_env ( "bytes_received", envp );
+
+                                const char *tx_string =
+                                        get_env ( "bytes_sent", envp );
+
+                                const char *duration_string =
+                                        get_env ( "time_duration", envp );
+
+                                if ( client_ip == NULL )
+                                {
+                                        throw Exception (
+                                                "RADIUS-PLUGIN: ACCOUNTING-STOP: client IP missing\n"
+                                        );
+                                }
+
+                                if ( client_port == NULL )
+                                {
+                                        throw Exception (
+                                                "RADIUS-PLUGIN: ACCOUNTING-STOP: client port missing\n"
+                                        );
+                                }
+
+                                string key =
+                                        string ( client_ip ) +
+                                        string ( ":" ) +
+                                        string ( client_port );
+
+                                UserPlugin *acctuser =
+                                        context->findUser ( key );
+
+                                if ( acctuser == NULL )
+                                {
+                                        throw Exception (
+                                                "RADIUS-PLUGIN: ACCOUNTING-STOP: user not found\n"
+                                        );
+                                }
+
+                                uint64_t rx = 0;
+                                uint64_t tx = 0;
+                                uint64_t duration = 0;
+
+                                if ( rx_string != NULL )
+                                {
+                                        rx = strtoull (
+                                                rx_string,
+                                                NULL,
+                                                10
+                                        );
+                                }
+
+                                if ( tx_string != NULL )
+                                {
+                                        tx = strtoull (
+                                                tx_string,
+                                                NULL,
+                                                10
+                                        );
+                                }
+
+                                if ( duration_string != NULL )
+                                {
+                                        duration = strtoull (
+                                                duration_string,
+                                                NULL,
+                                                10
+                                        );
+                                }
+
+                                UserAcct acct;
+
+                                acct.setUsername (
+                                        acctuser->getUsername()
+                                );
+
+                                acct.setCallingStationId (
+                                        acctuser->getCallingStationId()
+                                );
+
+                                acct.setPortnumber (
+                                        acctuser->getPortnumber()
+                                );
+
+                                acct.setSessionId (
+                                        acctuser->getSessionId()
+                                );
+
+                                if ( vpn_ip != NULL )
+                                {
+                                        acct.setFramedIp (
+                                                string ( vpn_ip )
+                                        );
+                                }
+                                else
+                                {
+                                        acct.setFramedIp (
+                                                acctuser->getFramedIp()
+                                        );
+                                }
+
+                                acct.setBytesIn (
+                                        (uint32_t)
+                                        ( rx & 0xffffffffULL )
+                                );
+
+                                acct.setGigaIn (
+                                        (uint32_t)
+                                        ( rx >> 32 )
+                                );
+
+                                acct.setBytesOut (
+                                        (uint32_t)
+                                        ( tx & 0xffffffffULL )
+                                );
+
+                                acct.setGigaOut (
+                                        (uint32_t)
+                                        ( tx >> 32 )
+                                );
+
+                                acct.setStarttime (
+                                        time ( NULL ) -
+                                        (time_t) duration
+                                );
+
+                                if ( DEBUG ( context->getVerbosity() ) )
+                                {
+                                        cerr << getTime()
+                                             << "RADIUS-PLUGIN: ACCOUNTING-STOP user="
+                                             << acctuser->getUsername()
+                                             << " session="
+                                             << acctuser->getSessionId()
+                                             << " duration="
+                                             << duration
+                                             << " rx="
+                                             << rx
+                                             << " tx="
+                                             << tx
+                                             << "\n";
+                                }
+
+                                if ( acct.sendStopPacket ( context ) != 0 )
+                                {
+                                        cerr << getTime()
+                                             << "RADIUS-PLUGIN: ACCOUNTING-STOP failed for "
+                                             << acctuser->getUsername()
+                                             << "\n";
+                                }
+                                else
+                                {
+                                        if ( DEBUG ( context->getVerbosity() ) )
+                                        {
+                                                cerr << getTime()
+                                                     << "RADIUS-PLUGIN: ACCOUNTING-STOP succeeded for "
+                                                     << acctuser->getUsername()
+                                                     << "\n";
+                                        }
+                                }
+
+                                context->delNasPort (
+                                        acctuser->getPortnumber()
+                                );
+
+                                context->delUser ( key );
+                        }
+                        catch ( Exception &e )
+                        {
+                                cerr << getTime() << e;
+                        }
+                        catch ( ... )
+                        {
+                                cerr << getTime()
+                                     << "RADIUS-PLUGIN: ACCOUNTING-STOP unknown exception\n";
+                        }
+
+                        return OPENVPN_PLUGIN_FUNC_SUCCESS;
+                }
 		return OPENVPN_PLUGIN_FUNC_ERROR;
 	}
 
