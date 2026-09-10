@@ -24,6 +24,140 @@
 #include "radiusplugin.h"
 
 
+static int openvpn_b64_value(char c)
+{
+        if (c >= 'A' && c <= 'Z')
+                return c - 'A';
+
+        if (c >= 'a' && c <= 'z')
+                return c - 'a' + 26;
+
+        if (c >= '0' && c <= '9')
+                return c - '0' + 52;
+
+        if (c == '+')
+                return 62;
+
+        if (c == '/')
+                return 63;
+
+        return -1;
+}
+
+
+static bool decode_openvpn_base64(
+        const std::string &input,
+        std::string &output
+)
+{
+        output.clear();
+
+        unsigned int value = 0;
+        int bits = -8;
+
+        for (
+                std::string::const_iterator it = input.begin();
+                it != input.end();
+                ++it
+        )
+        {
+                const char c = *it;
+
+                if (c == '=')
+                        break;
+
+                const int decoded = openvpn_b64_value(c);
+
+                if (decoded < 0)
+                        return false;
+
+                value = (value << 6) |
+                        static_cast<unsigned int>(decoded);
+
+                bits += 6;
+
+                if (bits >= 0)
+                {
+                        output.push_back(
+                                static_cast<char>(
+                                        (value >> bits) & 0xffU
+                                )
+                        );
+
+                        bits -= 8;
+                }
+        }
+
+        return true;
+}
+
+
+static bool split_scrv1_password(
+        const char *raw_password,
+        std::string &password,
+        std::string &otp
+)
+{
+        password.clear();
+        otp.clear();
+
+        if (raw_password == NULL)
+                return false;
+
+        const std::string raw(raw_password);
+
+        const std::string prefix = "SCRV1:";
+
+        if (raw.compare(0, prefix.length(), prefix) != 0)
+                return false;
+
+        const std::string::size_type separator =
+                raw.find(':', prefix.length());
+
+        if (separator == std::string::npos)
+                return false;
+
+        const std::string encoded_password =
+                raw.substr(
+                        prefix.length(),
+                        separator - prefix.length()
+                );
+
+        const std::string encoded_otp =
+                raw.substr(separator + 1);
+
+        cerr << getTime()
+             << encoded_password.length()
+             << ", encoded OTP length="
+             << encoded_otp.length()
+             << ".\n";
+
+        if (
+                !decode_openvpn_base64(
+                        encoded_password,
+                        password
+                )
+        )
+        {
+                return false;
+        }
+
+        if (
+                !decode_openvpn_base64(
+                        encoded_otp,
+                        otp
+                )
+        )
+        {
+                password.clear();
+                return false;
+        }
+
+        return true;
+}
+
+
+
 //define extern "C", so the c++ compiler generate a shared library
 //which is compatible with c programms
 extern "C"
@@ -339,7 +473,52 @@ extern "C"
                     
 				// get username, password, unrusted_ip and common_name from envp string array
 				newuser->setUsername ( get_env ( "username", envp ) );
-				newuser->setPassword ( get_env ( "password", envp ) );
+				const char *raw_password =
+				        get_env ( "password", envp );
+				cerr << getTime()
+     				     << (raw_password ? strlen(raw_password) : 0)
+     				     << ", SCRV1="
+                                     << ((raw_password && strncmp(raw_password, "SCRV1:", 6) == 0) ? "yes" : "no")
+                                     << ".\n";
+				std::string radius_password;
+				std::string otp_response;
+
+				if (
+				        split_scrv1_password (
+				                raw_password,
+				                radius_password,
+				                otp_response
+				        )
+				)
+				{
+				        if ( DEBUG ( context->getVerbosity() ) )
+				        {
+				                cerr << getTime()
+				                     << "RADIUS-PLUGIN: SCRV1 static challenge detected. "
+				                     << "Password length="
+				                     << radius_password.length()
+				                     << ", OTP length="
+				                     << otp_response.length()
+				                     << ".\n";
+				        }
+
+				        cerr << getTime()
+				             << "Password length=" << radius_password.length()
+				             << ", OTP length=" << otp_response.length()
+				             << ".\n";
+
+				        newuser->setPassword ( radius_password );
+				}
+				else
+				{
+				        if ( DEBUG ( context->getVerbosity() ) )
+				        {
+				                cerr << getTime()
+				                     << "RADIUS-PLUGIN: Standard password authentication.\n";
+				        }
+
+				        newuser->setPassword ( raw_password );
+				}
 
 				// it's ipv4
 				if ( get_env ( "untrusted_ip", envp ) !=NULL )
